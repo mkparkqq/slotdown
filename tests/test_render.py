@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from slotdown.check import check_document
 from slotdown.cli import app
 from slotdown.config import Config, ConfigError, load_config
 from slotdown.loader import load_document, parse_document
@@ -156,3 +157,17 @@ class TestCli:
         assert "경영진" in schema["description"]
         assert schema["required"] == ["summary", "risks"]
         assert schema["properties"]["risks"]["maxItems"] == 5
+
+
+def test_stock_picks_matches_golden():
+    # Real candles output (KODEX 200, 2026-11-13) captured as fixed data.
+    doc = load_document(FIXTURES / "stock-picks.sd")
+    output = render_document(doc, load_json("stock-picks.json"), {"base_ticker": "069500", "horizon": "long"})
+    assert output == (FIXTURES / "stock-picks.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "path", sorted((FIXTURES.parent.parent / "examples").glob("*.sd")), ids=lambda p: p.name
+)
+def test_examples_pass_check(path):
+    assert [str(i) for i in check_document(load_document(path))] == []

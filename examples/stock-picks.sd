@@ -1,0 +1,209 @@
+---
+name: stock_picks
+description: 기준 종목과 함께 보유하면 좋은 종목 추천 보고서
+instructions: |
+  개인 투자자가 읽는 보고서다. 한국어, 전문 용어 없이 간결한 문어체로 작성한다.
+
+  데이터는 candles CLI(../candles/candles)로 조회한다. 숫자는 출력값을 그대로 옮기고 계산·추정·반올림하지 않는다.
+  1. `candles hedge --ticker <inputs.base_ticker> --horizon <inputs.horizon>`
+     → 기준 종목 정보, 분석 기간, 추천 종목(자산군·상관계수·기대 연수익률·연 변동성), 추천 이유, 기대수익 근거.
+  2. 기준 종목과 각 추천 종목에 대해 같은 기간으로 `candles chart --ticker <코드> --period <P> --num <N>`
+     (horizon이 long이면 `--period week --num 52`, short이면 `--period day --num 60`)
+     → 종가 열을 오래된 순서 그대로 closes에 넣는다. 채권은 종가 대신 금리(%)가 나오며 그 값을 그대로 넣는다.
+
+  50:50 보유 시 기대수익·변동성, 기간별 예상 수익률, 차트 정규화는 템플릿이 계산하므로 생성하지 않는다.
+inputs:
+  base_ticker: { type: string, description: "기준 종목코드 (예: 005930, KR10YT)" }
+  horizon:
+    type: enum
+    values: [long, short]
+    description: "long: 주봉 156개(약 3년) 기준 장기 분석, short: 일봉 120개(약 6개월) 기준 단기 분석"
+fields:
+  as_of:
+    type: string
+    description: 기준일. chart 출력의 마지막 캔들 날짜 (YYYY-MM-DD)
+  analysis_period:
+    type: string
+    description: hedge 출력의 '분석 기간' 줄 내용 그대로
+    examples: ["주봉 수익률 156개, 2023-11-17 ~ 2026-11-13"]
+  summary:
+    type: string
+    description: >-
+      보고서 핵심을 3문장으로 요약. 기준 종목의 특징, 추천 조합의 공통 방향(어떤 위험을 나누는지),
+      가장 눈에 띄는 변동성 감소 효과를 수치로 포함
+  base:
+    type: object
+    description: 기준 종목 (hedge 출력의 '기준 종목' 줄)
+    fields:
+      name: { type: string, description: 종목명 }
+      asset_class: &asset_class
+        type: enum
+        values: [국내 주식, 해외 주식, 채권, 원자재, 기타]
+        description: hedge 출력의 자산군
+      expected_annual_return: { type: number, description: "기대 연수익률(%). +19.49%면 19.49" }
+      annual_volatility: { type: number, description: "연 변동성(%). 42.0%면 42.0" }
+      return_basis:
+        type: string
+        description: hedge '예상 수익률' 아래 근거 줄에서 종목명 뒤 내용
+        examples: ["과거 9.9년 (2016-12-29 ~) 연평균 수익률 +14.65% 기준 복리 환산"]
+      closes: &closes
+        type: list
+        min_items: 20
+        max_items: 120
+        description: chart 출력의 종가(채권은 금리)를 오래된 순으로. chart_dates와 같은 길이
+        items: { type: number }
+  recommendations:
+    type: list
+    min_items: 1
+    max_items: 5
+    description: hedge 출력의 분산 투자 추천 표 순서 그대로
+    items:
+      type: object
+      fields:
+        name: { type: string, description: 종목명 }
+        code: { type: string, description: 종목코드 }
+        asset_class: *asset_class
+        correlation: { type: number, description: 기준 종목과의 상관계수 (-1 ~ 1) }
+        expected_annual_return: { type: number, description: "기대 연수익률(%)" }
+        annual_volatility: { type: number, description: "연 변동성(%)" }
+        return_basis:
+          type: string
+          description: hedge '예상 수익률' 아래 근거 줄에서 종목명 뒤 내용
+        rationale:
+          type: string
+          description: >-
+            함께 사면 좋은 이유 2~3문장. hedge의 추천 이유를 바탕으로, 이 종목이 어떤 위험을 나누는지와
+            기준 종목과 어떻게 다르게 움직였는지를 일상 언어로 풀어 쓴다. 수치는 위 필드에 있으므로 반복하지 않는다
+        closes: *closes
+  chart_dates:
+    type: list
+    min_items: 20
+    max_items: 120
+    description: 기준 종목 chart 출력의 날짜 열 (YYYY-MM-DD, 오래된 순)
+    items: { type: string }
+  cautions:
+    type: list
+    optional: true
+    max_items: 3
+    description: "이 조합에만 해당하는 주의점 (예: 특정 종목의 최근 급등, 짧은 근거 기간, 환율 노출). 없으면 null"
+    items: { type: string }
+---
+{%- macro pct(x) %}{{ "%+.2f%%" | format(x) }}{% endmacro -%}
+{%- macro vol(x) %}{{ "%.1f%%" | format(x) }}{% endmacro -%}
+{#- hedge와 같은 공식: 50:50 기대수익 = 평균, 변동성 = sqrt(0.25σa² + 0.25σb² + 0.5ρσaσb) -#}
+{%- macro combo_return(r) %}{{ pct((base.expected_annual_return + r.expected_annual_return) / 2) }}{% endmacro -%}
+{%- macro combo_vol(r) -%}
+{{ vol((0.25 * base.annual_volatility ** 2 + 0.25 * r.annual_volatility ** 2
+        + 0.5 * r.correlation * base.annual_volatility * r.annual_volatility) ** 0.5) }}
+{%- endmacro -%}
+{%- macro projected(annual, months) %}{{ pct(((1 + annual / 100) ** (months / 12) - 1) * 100) }}{% endmacro -%}
+{%- macro corr_label(c) -%}
+{{ "강한" if c | abs >= 0.7 else "보통" if c | abs >= 0.3 else "약한" }} {{ "음의" if c < 0 else "양의" }} 상관
+{%- endmacro -%}
+{%- set horizon_label = "장기 (약 3년 주봉)" if inputs.horizon == "long" else "단기 (약 6개월 일봉)" -%}
+{%- set chart_span = (chart_dates | length) ~ ("주" if inputs.horizon == "long" else "거래일") -%}
+{#- 채권 closes는 금리라 변동률(%) 대신 금리 차이(%p)로 표시 -#}
+{%- macro change(a) -%}
+{%- if a.asset_class == "채권" %}{{ "%+.2f%%p" | format(a.closes[-1] - a.closes[0]) }}
+{%- else %}{{ pct((a.closes[-1] / a.closes[0] - 1) * 100) }}{% endif -%}
+{%- endmacro -%}
+{%- set assets = [base] + recommendations -%}
+{%- set price_assets = assets | rejectattr("asset_class", "eq", "채권") | list -%}
+{%- set yield_assets = assets | selectattr("asset_class", "eq", "채권") | list -%}
+{%- set colors = ["#333333", "#e74c3c", "#3498db", "#2ecc71", "#e67e22", "#9b59b6"] -%}
+{%- set swatches = ["⬛", "🟥", "🟦", "🟩", "🟧", "🟪"] -%}
+# {{ base.name }} ({{ inputs.base_ticker }}) 함께 사면 좋은 종목
+
+기준일 {{ as_of }} · 분석 {{ horizon_label }} · {{ analysis_period }}
+
+## 요약
+{{ summary }}
+
+## 기준 종목
+| 종목 | 자산군 | 기대 연수익률 | 연 변동성 | 최근 {{ chart_span }} 변동 |
+| --- | --- | ---: | ---: | ---: |
+| {{ base.name }} ({{ inputs.base_ticker }}) | {{ base.asset_class }} | {{ pct(base.expected_annual_return) }} | {{ vol(base.annual_volatility) }} | {{ change(base) }} |
+
+## 추천 종목
+기준 종목과 각 추천 종목을 반씩(50:50) 보유했을 때의 기대수익과 변동성을 함께 보여준다.
+변동성이 낮을수록 가격이 덜 출렁인다.
+
+| 종목 | 자산군 | 상관계수 | 기대 연수익률 | 연 변동성 | 50:50 기대수익 | 50:50 변동성 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+{% for r in recommendations %}
+| {{ r.name }} ({{ r.code }}) | {{ r.asset_class }} | {{ "%+.4f" | format(r.correlation) }} | {{ pct(r.expected_annual_return) }} | {{ vol(r.annual_volatility) }} | {{ combo_return(r) }} | {{ combo_vol(r) }} |
+{% endfor %}
+
+{% for r in recommendations %}
+### {{ loop.index }}. {{ r.name }}
+{{ r.rationale }}
+
+- {{ corr_label(r.correlation) }}, 함께 보유 시 변동성 {{ vol(base.annual_volatility) }} → {{ combo_vol(r) }}
+
+{% endfor %}
+## 가격 추이
+{% if price_assets %}
+최근 {{ chart_span }} 동안의 오르내림을 시작일 가격을 100으로 맞춰 비교한다.
+
+{% for a in price_assets %}{{ swatches[loop.index0] }} {{ a.name }}{{ " · " if not loop.last }}{% endfor %}
+
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "{{ colors[:price_assets | length] | join(', ') }}"}}}}%%
+xychart-beta
+  title "가격 추이 (시작일 = 100)"
+  x-axis [{% for d in chart_dates %}"{{ d[2:] }}"{{ ", " if not loop.last }}{% endfor %}]
+  y-axis "시작일 대비"
+{% for a in price_assets %}
+  line [{% for c in a.closes %}{{ (c / a.closes[0] * 100) | round(1) }}{{ ", " if not loop.last }}{% endfor %}]
+{% endfor %}
+```
+{% endif %}
+{% if yield_assets %}
+
+채권은 가격 대신 금리(%)를 표시한다. 금리가 오르면 채권 가격은 내려간다.
+
+{% for a in yield_assets %}{{ swatches[loop.index0] }} {{ a.name }}{{ " · " if not loop.last }}{% endfor %}
+
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "{{ colors[:yield_assets | length] | join(', ') }}"}}}}%%
+xychart-beta
+  title "금리 추이 (%)"
+  x-axis [{% for d in chart_dates %}"{{ d[2:] }}"{{ ", " if not loop.last }}{% endfor %}]
+  y-axis "금리 (%)"
+{% for a in yield_assets %}
+  line [{% for c in a.closes %}{{ c }}{{ ", " if not loop.last }}{% endfor %}]
+{% endfor %}
+```
+{% endif %}
+
+| 종목 | 시작 ({{ chart_dates[0] }}) | 끝 ({{ chart_dates[-1] }}) | 변동 |
+| --- | ---: | ---: | ---: |
+{% for a in assets %}
+| {{ a.name }} | {{ "{:,}".format(a.closes[0]) }} | {{ "{:,}".format(a.closes[-1]) }} | {{ change(a) }} |
+{% endfor %}
+
+## 예상 수익률
+과거 연평균 수익률이 앞으로도 이어진다고 가정한 복리 환산값이다.
+
+| 종목 | 3개월 | 6개월 | 1년 | 5년 | 10년 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+{% for a in assets %}
+| {{ a.name }} | {{ projected(a.expected_annual_return, 3) }} | {{ projected(a.expected_annual_return, 6) }} | {{ projected(a.expected_annual_return, 12) }} | {{ projected(a.expected_annual_return, 60) }} | {{ projected(a.expected_annual_return, 120) }} |
+{% endfor %}
+
+{% for a in assets %}
+- {{ a.name }}: {{ a.return_basis }}
+{% endfor %}
+
+## 유의 사항
+{% if cautions %}
+{% for c in cautions %}
+- {{ c }}
+{% endfor %}
+{% endif %}
+- 상관계수는 기간에 따라 변하며, 위기 때는 대부분 자산이 함께 움직이는 경향이 있다.
+- 예상 수익률은 과거 수익률을 그대로 연장한 단순 추정치로, 미래 수익을 보장하지 않는다.
+- 가격에는 분배금이 반영되지 않아 분배금이 큰 ETF는 수익률이 낮게 계산된다.
+- 데이터 출처: 네이버 증권 (candles CLI). 투자 판단의 책임은 투자자 본인에게 있다.
