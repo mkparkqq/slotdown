@@ -1,0 +1,43 @@
+---
+name: weekly_report
+description: 팀 주간 업무 보고서
+instructions: |            # 문서 전체에 적용되는 공통 지시 (톤, 언어, 독자 등)
+  경영진이 읽는 보고서다. 한국어, 간결한 문어체로 작성한다.
+inputs:                    # 사용자가 직접 넣는 값 (AI가 생성하지 않음)
+  team_name: { type: string }
+  raw_notes: { type: string, description: 이번 주 업무 메모 원문 }
+fields:                    # AI가 생성할 값
+  summary:
+    type: string
+    description: 핵심 성과를 수치 포함 3문장으로 요약
+  risks:
+    type: list
+    max_items: 5
+    description: 중요도 순 리스크
+    items:
+      type: object
+      fields:
+        title: { type: string, description: 10자 이내 리스크 이름 }
+        mitigation: { type: string, description: 구체적 완화 방안 1~2문장 }
+  open_questions:
+    type: list
+    optional: true
+    description: 미해결 사항. 없으면 null
+    items: { type: string }
+---
+# {{ inputs.team_name }} 주간 보고
+
+## 요약
+{{ summary }}
+
+## 리스크
+{% for r in risks %}
+### {{ loop.index }}. {{ r.title }}
+{{ r.mitigation }}
+{% endfor %}
+
+{% if open_questions %}
+## 미해결 사항
+{% for q in open_questions %}- {{ q }}
+{% endfor %}
+{% endif %}
